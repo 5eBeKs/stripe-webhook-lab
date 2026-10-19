@@ -1,0 +1,16 @@
+# Supabase CLI settings. The stand reads only verify_jwt: whether the gateway checks the caller's JWT
+# before a function runs (true unless set to false, as in Supabase).
+project_id = "ticket-lab"
+
+[functions.create-checkout]
+verify_jwt = true
+
+[functions.verify-checkout]
+verify_jwt = true
+
+# Stripe calls the webhook without a Supabase JWT; the function checks Stripe's signature instead.
+[functions.stripe-webhook]
+verify_jwt = false
+
+[functions.refund-ticket]
+verify_jwt = true

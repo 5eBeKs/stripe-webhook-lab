@@ -1,0 +1,210 @@
+# Two versions of a small Supabase + Stripe ticket app (app/naive, app/fixed) on one stand.
+#   docker compose run --rm check    builds the stand, checks both versions, prints a table for each
+#   docker compose down -v           removes the stand and its volumes
+#
+# The stand runs on a network with no way out ("lab", internal). Only the bundle step goes online, to download
+# the functions' imports. No port is published on your machine. The secrets below are placeholders that work
+# only inside this stand; none of them is a real key.
+name: webhook-lab
+
+networks:
+  lab:
+    internal: true
+  online: {}
+
+volumes:
+  bundles: {}
+  tls: {}
+
+x-images:
+  postgres: &postgres public.ecr.aws/supabase/postgres:17.11.0.004@sha256:06ddc7962e11ab0f4f0334fd05671e97c30ea202f6e6a7113800bd3d6e416108
+  gotrue: &gotrue public.ecr.aws/supabase/gotrue:v2.197.0@sha256:1736a63078f5922b198c4cbe50f80ab9a2d3b54fe8b7b6cfb2e9dc5dbbc12c6b
+  postgrest: &postgrest public.ecr.aws/supabase/postgrest:v16.4@sha256:d155c6718ed9a9f990d159a2ab7c0a3f16944dbb6d0a0344557421042acfe0df
+  edge: &edge public.ecr.aws/supabase/edge-runtime:v1.77.4@sha256:ad45164b7548bf5820ed7be714789c17ac2865edce79a09cfb4c3756c3d365a8
+  node: &node node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
+
+x-placeholders:
+  jwt-secret: &jwt-secret webhook-lab-placeholder-jwt-secret-for-this-stand-only
+  db-password: &db-password webhook-lab-placeholder-db-password
+  stripe-key: &stripe-key sk_test_webhook_lab_placeholder
+  webhook-secret: &webhook-secret whsec_webhook_lab_placeholder
+
+x-db: &db
+  image: *postgres
+  networks: [lab]
+  environment:
+    POSTGRES_PASSWORD: *db-password
+    POSTGRES_HOST: /var/run/postgresql
+    POSTGRES_DB: postgres
+    PGPORT: 5432
+    JWT_SECRET: *jwt-secret
+    JWT_EXP: 3600
+  volumes:
+    - ./stand/db/init.sql:/docker-entrypoint-initdb.d/init-scripts/99-stand.sql:ro
+  tmpfs:
+    - /var/lib/postgresql/data
+  command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf", "-c", "log_min_messages=fatal"]
+  healthcheck:
+    test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+    interval: 2s
+    timeout: 3s
+    retries: 60
+
+x-auth-env: &auth-env
+  GOTRUE_API_HOST: 0.0.0.0
+  GOTRUE_API_PORT: 9999
+  API_EXTERNAL_URL: http://gateway:9000
+  GOTRUE_DB_DRIVER: postgres
+  GOTRUE_SITE_URL: http://localhost:5173
+  GOTRUE_DISABLE_SIGNUP: "false"
+  GOTRUE_JWT_ADMIN_ROLES: service_role
+  GOTRUE_JWT_AUD: authenticated
+  GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+  GOTRUE_JWT_EXP: 3600
+  GOTRUE_JWT_SECRET: *jwt-secret
+  GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+  GOTRUE_MAILER_AUTOCONFIRM: "true"
+  GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+
+x-rest-env: &rest-env
+  PGRST_DB_SCHEMAS: public
+  PGRST_DB_ANON_ROLE: anon
+  PGRST_JWT_SECRET: *jwt-secret
+  PGRST_DB_EXTRA_SEARCH_PATH: public,extensions
+
+x-migrate: &migrate
+  image: *postgres
+  networks: [lab]
+  entrypoint: ["sh", "/stand-db/migrate.sh"]
+
+services:
+  # a test CA and a certificate for api.stripe.com, made once per stand, until `docker compose down -v`
+  certs:
+    image: *edge
+    network_mode: none
+    volumes:
+      - ./stand/certs.sh:/certs.sh:ro
+      - tls:/tls
+    entrypoint: ["sh", "/certs.sh"]
+
+  # the only step online: each function of each version and its imports, packed into one eszip file
+  bundle:
+    image: *edge
+    networks: [online]
+    environment:
+      VERSIONS: naive fixed
+    volumes:
+      - ./app:/app:ro
+      - ./stand/bundle.sh:/bundle.sh:ro
+      - bundles:/bundles
+    entrypoint: ["sh", "/bundle.sh"]
+
+  # one Supabase per version: Postgres, auth (GoTrue) and the database API (PostgREST), official images
+  db-naive: *db
+  db-fixed: *db
+
+  auth-naive:
+    image: *gotrue
+    networks: [lab]
+    depends_on: { db-naive: { condition: service_healthy } }
+    restart: on-failure
+    environment:
+      <<: *auth-env
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:webhook-lab-placeholder-db-password@db-naive:5432/postgres
+  auth-fixed:
+    image: *gotrue
+    networks: [lab]
+    depends_on: { db-fixed: { condition: service_healthy } }
+    restart: on-failure
+    environment:
+      <<: *auth-env
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:webhook-lab-placeholder-db-password@db-fixed:5432/postgres
+
+  migrate-naive:
+    <<: *migrate
+    depends_on: { db-naive: { condition: service_healthy } }
+    environment: { VERSION: naive, PGHOST: db-naive, PGPASSWORD: *db-password }
+    volumes:
+      - ./app/naive/supabase:/supabase:ro
+      - ./stand/db:/stand-db:ro
+  migrate-fixed:
+    <<: *migrate
+    depends_on: { db-fixed: { condition: service_healthy } }
+    environment: { VERSION: fixed, PGHOST: db-fixed, PGPASSWORD: *db-password }
+    volumes:
+      - ./app/fixed/supabase:/supabase:ro
+      - ./stand/db:/stand-db:ro
+
+  rest-naive:
+    image: *postgrest
+    networks: [lab]
+    depends_on: { migrate-naive: { condition: service_completed_successfully } }
+    restart: on-failure
+    environment:
+      <<: *rest-env
+      PGRST_DB_URI: postgres://authenticator:webhook-lab-placeholder-db-password@db-naive:5432/postgres
+  rest-fixed:
+    image: *postgrest
+    networks: [lab]
+    depends_on: { migrate-fixed: { condition: service_completed_successfully } }
+    restart: on-failure
+    environment:
+      <<: *rest-env
+      PGRST_DB_URI: postgres://authenticator:webhook-lab-placeholder-db-password@db-fixed:5432/postgres
+
+  # Stripe, answered by the stand under its real name
+  stripe:
+    image: *node
+    networks:
+      lab:
+        aliases: [api.stripe.com]
+    depends_on: { certs: { condition: service_completed_successfully } }
+    environment:
+      STRIPE_SECRET_KEY: *stripe-key
+      PRICES: '{"price_lab_night": {"unit_amount": 2500, "currency": "eur"}}'
+    volumes:
+      - ./stand/stripe:/stripe:ro
+      - tls:/tls:ro
+    command: ["node", "/stripe/server.mjs"]
+
+  # the functions of both versions, in Supabase's edge-runtime, behind the stand's gateway
+  gateway:
+    image: *edge
+    networks: [lab]
+    depends_on:
+      bundle: { condition: service_completed_successfully }
+      stripe: { condition: service_started }
+      auth-naive: { condition: service_started }
+      auth-fixed: { condition: service_started }
+      rest-naive: { condition: service_started }
+      rest-fixed: { condition: service_started }
+    environment:
+      VERSIONS: naive fixed
+      JWT_SECRET: *jwt-secret
+      FUNCTION_ENV: STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET SITE_URL
+      STRIPE_SECRET_KEY: *stripe-key
+      STRIPE_WEBHOOK_SECRET: *webhook-secret
+      SITE_URL: http://localhost:5173
+      # the functions are given the stand's test CA as the one to trust
+      DENO_TLS_CA_STORE: system
+      SSL_CERT_FILE: /tls/ca.pem
+    volumes:
+      - ./stand/gateway:/gateway:ro
+      - ./app:/app:ro
+      - bundles:/bundles:ro
+      - tls:/tls:ro
+    command: ["start", "--main-service", "/gateway", "--port", "9000"]
+
+  # the check: the rows for each version, then the summary line
+  check:
+    image: *node
+    networks: [lab]
+    depends_on:
+      gateway: { condition: service_started }
+    environment:
+      VERSIONS: naive fixed
+      JWT_SECRET: *jwt-secret
+      STRIPE_WEBHOOK_SECRET: *webhook-secret
+    volumes:
+      - ./stand/check:/check:ro
+    entrypoint: ["node", "/check/run.mjs"]

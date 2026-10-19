@@ -1,0 +1,103 @@
+Stripe webhook lab: a ticket app in two versions, on a stand with no way out
+network: example.com does not resolve, 1.1.1.1 is unreachable, api.stripe.com is the stand's Stripe
+
+R1  A paid checkout gives the buyer one paid ticket with a code, whichever comes first, the webhook
+    or the success page. A checkout left unpaid gives none.
+R2  A ticket is given only for money received, as Stripe reports it: not for an event without
+    Stripe's signature, not while a bank debit is on its way, never for one that failed. No second
+    checkout while it is on its way.
+R3  A settled ticket stays settled: an event delivered again or the success page opened again does
+    not undo a refund. The organiser's figures show every refund.
+R4  A refund reaches the ticket even when it comes before the ticket was confirmed.
+R5  The webhook answers 2xx only once the change is saved, so that Stripe delivers the event again
+    otherwise.
+R6  Only a payment makes a paid ticket: a buyer cannot write one through the database API.
+R7  The door admits a paid or partly refunded ticket, once.
+
+naive (app/naive: create-checkout, refund-ticket, stripe-webhook, verify-checkout)
+
+ #  rule  expected                                                            got                                                verdict
+ 1  R1    webhook first: answer 200; one paid ticket, 25.00, with a code      answer 200; paid 25.00, code                       match
+ 2  R1    success page first: the page says paid; one paid ticket             page: paid; paid 25.00, code                       match
+ 3  R1    then the webhook: still one paid ticket, with the same code         paid 25.00, code                                   match
+ 4  R1    checkout left unpaid until it expires: ticket expired, no code      answer 200; expired                                match
+ 5  R2    an event without Stripe's signature: answer 400, ticket unchanged   answer 400; pending                                match
+ 6  R2    bank debit: checkout completed, payment unpaid: no paid ticket yet  paid 25.00, code                                   DIFFERS
+ 7  R2    the buyer presses Buy again meanwhile: the same ticket, processing  answer 200; paid, the same ticket                  DIFFERS
+ 8  R2    the debit fails: ticket failed, no code                             paid 25.00, code                                   DIFFERS
+ 9  R2    then the buyer presses Buy again: a new checkout to pay             answer 200; paid                                   DIFFERS
+10  R2    a debit fails before its completed event arrives: failed, no code   paid 25.00, code                                   DIFFERS
+11  R2    another debit clears: one paid ticket, 25.00, with a code           paid 25.00, code                                   match
+12  R3    refund 25.00 from the app: ticket refunded, 25.00                   refunded 25.00 of 25.00, code                      match
+13  R3    then Stripe delivers the completed event again: still refunded      paid 25.00, code                                   DIFFERS
+14  R3    another refunded buyer reopens the success page: still refunded     page: paid; paid 25.00, code                       DIFFERS
+15  R3    a third buyer, partial refund 10.00: partly refunded, 10.00         partially refunded 10.00 of 25.00, code            match
+16  R3    organiser's figures: 3 sold, gross 75.00, refunds 60.00, net 15.00  3 sold, gross 75.00, refunds 10.00, net 65.00      DIFFERS
+17  R3    the older partial refund event after the full one: still refunded   partially refunded 10.00 of 25.00, code            DIFFERS
+18  R4    refund in the Dashboard before the ticket is confirmed: refunded    answer 200; pending                                DIFFERS
+19  R4    then the late completed event and the success page: still refunded  page: paid; paid 25.00, code                       DIFFERS
+20  R4    organiser's figures: 1 sold, gross 25.00, refunds 25.00, net 0.00   1 sold, gross 25.00, refunds 0.00, net 25.00       DIFFERS
+21  R4    partial refund 10.00 in the Dashboard first: partly refunded, code  answer 200; pending                                DIFFERS
+22  R4    then the late completed event; the door: partly refunded, admitted  paid 25.00, code; admitted                         DIFFERS
+23  R5    database refuses: completed event answered 2xx only if saved        answer 200; pending                                DIFFERS
+24  R5    ... after Stripe's retry, if any: one paid ticket                   no retry; pending                                  DIFFERS
+25  R5    database refuses: refund event answered 2xx only if saved           answer 200; paid 25.00, code                       DIFFERS
+26  R5    ... after Stripe's retry, if any: ticket refunded, 25.00            no retry; paid 25.00, code                         DIFFERS
+27  R5    database hangs: completed event answered 2xx only if saved          no answer in 10 s; paid 25.00, code                match
+28  R5    ... after Stripe's retry, if any: one paid ticket                   retry answered 200; paid 25.00, code               match
+29  R5    database hangs: refund event answered 2xx only if saved             no answer in 10 s; refunded 25.00 of 25.00, code   match
+30  R5    ... after Stripe's retry, if any: ticket refunded, 25.00            retry answered 200; refunded 25.00 of 25.00, code  match
+31  R6    a buyer writes a paid ticket for themselves via the API: refused    answer 201; paid 0.00, code                        DIFFERS
+32  R6    door: the code of the ticket the buyer wrote: not admitted          admitted                                           DIFFERS
+33  R7    door: a paid ticket: admitted                                       admitted                                           match
+34  R7    door: the same ticket again: not admitted                           not admitted (already checked in)                  match
+35  R7    door: a partly refunded ticket: admitted                            admitted                                           match
+36  R7    door: a refunded ticket: not admitted                               admitted                                           DIFFERS
+
+naive: 21 of 36 rows differ
+
+fixed (app/fixed: create-checkout, refund-ticket, stripe-webhook, verify-checkout)
+
+ #  rule  expected                                                            got                                                  verdict
+ 1  R1    webhook first: answer 200; one paid ticket, 25.00, with a code      answer 200; paid 25.00, code                         match
+ 2  R1    success page first: the page says paid; one paid ticket             page: paid; paid 25.00, code                         match
+ 3  R1    then the webhook: still one paid ticket, with the same code         paid 25.00, code                                     match
+ 4  R1    checkout left unpaid until it expires: ticket expired, no code      answer 200; expired                                  match
+ 5  R2    an event without Stripe's signature: answer 400, ticket unchanged   answer 400; pending                                  match
+ 6  R2    bank debit: checkout completed, payment unpaid: no paid ticket yet  processing                                           match
+ 7  R2    the buyer presses Buy again meanwhile: the same ticket, processing  answer 200; processing, the same ticket              match
+ 8  R2    the debit fails: ticket failed, no code                             failed                                               match
+ 9  R2    then the buyer presses Buy again: a new checkout to pay             answer 200; a new checkout                           match
+10  R2    a debit fails before its completed event arrives: failed, no code   failed                                               match
+11  R2    another debit clears: one paid ticket, 25.00, with a code           paid 25.00, code                                     match
+12  R3    refund 25.00 from the app: ticket refunded, 25.00                   refunded 25.00 of 25.00, code                        match
+13  R3    then Stripe delivers the completed event again: still refunded      refunded 25.00 of 25.00, code                        match
+14  R3    another refunded buyer reopens the success page: still refunded     page: refunded; refunded 25.00 of 25.00, code        match
+15  R3    a third buyer, partial refund 10.00: partly refunded, 10.00         partially refunded 10.00 of 25.00, code              match
+16  R3    organiser's figures: 3 sold, gross 75.00, refunds 60.00, net 15.00  3 sold, gross 75.00, refunds 60.00, net 15.00        match
+17  R3    the older partial refund event after the full one: still refunded   refunded 25.00 of 25.00, code                        match
+18  R4    refund in the Dashboard before the ticket is confirmed: refunded    answer 200; refunded 25.00 of 25.00                  match
+19  R4    then the late completed event and the success page: still refunded  page: refunded; refunded 25.00 of 25.00              match
+20  R4    organiser's figures: 1 sold, gross 25.00, refunds 25.00, net 0.00   1 sold, gross 25.00, refunds 25.00, net 0.00         match
+21  R4    partial refund 10.00 in the Dashboard first: partly refunded, code  answer 200; partially refunded 10.00 of 25.00, code  match
+22  R4    then the late completed event; the door: partly refunded, admitted  partially refunded 10.00 of 25.00, code; admitted    match
+23  R5    database refuses: completed event answered 2xx only if saved        answer 500; pending                                  match
+24  R5    ... after Stripe's retry, if any: one paid ticket                   retry answered 200; paid 25.00, code                 match
+25  R5    database refuses: refund event answered 2xx only if saved           answer 500; paid 25.00, code                         match
+26  R5    ... after Stripe's retry, if any: ticket refunded, 25.00            retry answered 200; refunded 25.00 of 25.00, code    match
+27  R5    database hangs: completed event answered 2xx only if saved          no answer in 10 s; paid 25.00, code                  match
+28  R5    ... after Stripe's retry, if any: one paid ticket                   retry answered 200; paid 25.00, code                 match
+29  R5    database hangs: refund event answered 2xx only if saved             no answer in 10 s; refunded 25.00 of 25.00, code     match
+30  R5    ... after Stripe's retry, if any: ticket refunded, 25.00            retry answered 200; refunded 25.00 of 25.00, code    match
+31  R6    a buyer writes a paid ticket for themselves via the API: refused    answer 403; no ticket                                match
+32  R6    door: the code of the ticket the buyer wrote: not admitted          not admitted (unknown code)                          match
+33  R7    door: a paid ticket: admitted                                       admitted                                             match
+34  R7    door: the same ticket again: not admitted                           not admitted (already checked in)                    match
+35  R7    door: a partly refunded ticket: admitted                            admitted                                             match
+36  R7    door: a refunded ticket: not admitted                               not admitted (ticket is refunded)                    match
+
+fixed: all 36 rows match
+
+Stripe calls the stand did not answer: none
+
+naive: 21 of 36 rows differ / fixed: all 36 rows match
