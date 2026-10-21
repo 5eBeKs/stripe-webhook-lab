@@ -24,7 +24,13 @@ naive: 21 of 36 rows differ / fixed: all 36 rows match
 
 `runs/check.txt` is the full output of that command on a clean clone. A run takes about a minute once the images are there. No port is opened on your machine.
 
-- `.env` makes Compose pull the images one at a time. If a registry still answers `Rate exceeded`, run the command again; the images already pulled are kept.
+- `.env` makes Compose pull the images one at a time. A registry can still refuse a pull because of a limit. The first error in the output names the limit; the `Interrupted` and `No such image` lines after it only result from it.
+  - `Rate exceeded`: run the command again; the images already pulled are kept.
+  - `Data limit exceeded` from `public.ecr.aws` (also seen as `429 Too Many Requests` with `toomanyrequests: Data limit exceeded`): this is its limit for pulls without an account, counted by address. Running again a minute or two later can help. From an address that many people share, such as a CI runner or a cloud machine, it may keep failing. Then run from another network, or log in to `public.ecr.aws` with an AWS account first: pulls with an account have a higher limit.
+- On a network that lets traffic out only to listed addresses, the run needs:
+  - `public.ecr.aws` for the four Supabase images, and the `cloudfront.net` address it redirects their layers to, which can change (`d2glxqk2uabbnd.cloudfront.net` when this was written);
+  - Docker Hub for the `node` image: `registry-1.docker.io`, `auth.docker.io`, and the address it redirects the layers to, which can also change (`production.cloudfront.docker.com` when this was written);
+  - `registry.npmjs.org` for the npm packages the bundle step downloads.
 - On a host with SELinux enforcing (Fedora, RHEL), add `:z` to every mount from the repository in `compose.yaml`, files as well as folders (`./app:/app:ro,z`, `./stand/certs.sh:/certs.sh:ro,z`, `./stand/bundle.sh`, `./stand/db/init.sql`, and so on), or the containers cannot read them.
 
 To remove the stand and its volumes:
